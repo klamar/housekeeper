@@ -1,0 +1,11 @@
+_common:
+  name: housekeeper
+  meta:
+    maintainer: Martin Klapproth
+    homepage: https://github.com/klamar/housekeeper
+    description: |
+      Keeps file system structures clean (auto removal)
+
+debian7:
+  type: deb
+  sync_script: build.sh
