@@ -8,7 +8,7 @@ from copy import deepcopy
 from genericpath import isfile, isdir
 from glob import glob
 import os
-from os.path import join
+from os.path import join, islink
 from subprocess import Popen, PIPE, STDOUT
 import sys
 
@@ -18,10 +18,32 @@ parser.add_argument('job', metavar='JOB', type=str, nargs='*')
 parser.add_argument('-n', "--noop", action="store_true")
 parser.add_argument('-r', "--run", action="store_true")
 parser.add_argument('-s', "--silent", action="store_true")
+parser.add_argument('-v', "--verbose", action="store_true")
+parser.add_argument('-c', "--config", action="store")
 
 args = parser.parse_args()
 
+import logging
+logger = logging.getLogger()
+sh = logging.StreamHandler(sys.stdout)
+sh.setFormatter(logging.Formatter("%(asctime)s %(levelname)-8s %(name)-12s %(message)s", datefmt='%Y-%m-%d %H:%M:%S'))
+logger.addHandler(sh)
+logger.setLevel(logging.WARNING)
+if args.verbose:
+    logger.setLevel(logging.DEBUG)
+
 CONFIG_DIR = "/etc/housekeeper"
+CONFIG_FILE = None
+
+if args.config:
+    if isdir(args.config):
+        CONFIG_DIR = args.config
+    elif isfile(args.config) or islink(args.config):
+        CONFIG_DIR = None
+        CONFIG_FILE = args.config
+    else:
+        print("Invalid config argument '%s', must be a file or directory" % args.config)
+        sys.exit(1)
 
 NOOP = True
 
@@ -62,15 +84,24 @@ class FindRemoveJob(Job):
     def __init__(self, *args, **kwargs):
         super(FindRemoveJob, self).__init__(*args, **kwargs)
 
+        self.roots = []
+
         try:
-            self.root = self.config["root"]
+            root_expression = self.config["root"]
         except KeyError:
             raise RuntimeError("%s: field 'root' needs to be defined" % self.name)
 
-        self.root = self.root.rstrip("/")
+        if "*" in root_expression:
+            self.roots = glob(root_expression)
+        else:
+            self.roots = [root_expression]
 
-        if not isdir(self.root):
-            raise RuntimeError("%s: root %s needs to be an existing directory" % (self.name, self.root))
+        self.roots = [r.rstrip("/") for r in self.roots]
+        self.roots.sort()
+
+        for root in self.roots:
+            if not isdir(root):
+                raise RuntimeError("%s: root %s needs to be an existing directory" % (self.name, root))
 
         if type(self.config["recurse"]) == str:
             self.config["recurse"] = eval(self.config["recurse"])
@@ -79,37 +110,39 @@ class FindRemoveJob(Job):
         """
         :return:
         """
-        cmd = self.generate_find_command()
-        cmd.append("-delete")
+        for root in self.roots:
+            cmd = self.generate_find_command(root)
+            cmd.append("-delete")
 
-        output("%s: execute command: %s (do not copy-paste this command)" % (self.name, " ".join(cmd)))
+            output("%s: execute command: %s (do not copy-paste this command)" % (self.name, " ".join(cmd)))
 
-        popen = Popen(cmd, stdout=PIPE, stderr=STDOUT)
-        popen.communicate()
+            popen = Popen(cmd, stdout=PIPE, stderr=STDOUT)
+            popen.communicate()
 
     def noop(self):
         """
 
         :return:
         """
-        cmd = self.generate_find_command()
+        for root in self.roots:
+            cmd = self.generate_find_command(root)
 
-        if NOOP:
-            output("%s: execute command: %s" % (self.name, " ".join(cmd)))
+            if NOOP:
+                output("%s: execute command: %s" % (self.name, " ".join(cmd)))
 
-        popen = Popen(cmd, stdout=PIPE, stderr=STDOUT)
-        out, _ = popen.communicate()
+            popen = Popen(cmd, stdout=PIPE, stderr=STDOUT)
+            out, _ = popen.communicate()
 
-        for line in out.splitlines():
-            output("%s: would remove: %s" % (self.name, line))
+            for line in out.splitlines():
+                output("%s: would remove: %s" % (self.name, line))
 
-    def generate_find_command(self, type="f"):
+    def generate_find_command(self, root, type="f"):
         """
         """
         if not "match" in self.config and not "older" in self.config:
             raise RuntimeError("either 'match' or 'older' needs to be defined")
 
-        cmd = ["find", self.root]
+        cmd = ["find", root]
 
         # maxdepth
         if "depth" in self.config:
@@ -151,8 +184,8 @@ class Keep(FindRemoveJob):
     """
     PARAMETERS = ["depth", "match", "older", "recurse", "root", "keep"]
 
-    def get_file_list(self):
-        cmd = self.generate_find_command()
+    def get_file_list(self, root):
+        cmd = self.generate_find_command(root)
 
         if NOOP:
             output("%s: execute command: %s" % (self.name, " ".join(cmd)))
@@ -164,20 +197,21 @@ class Keep(FindRemoveJob):
             return out.splitlines()
 
     def get_files_to_consider(self):
-        file_list = self.get_file_list()
+        for root in self.roots:
+            file_list = self.get_file_list(root)
 
-        order = []
+            order = []
 
-        for file in file_list:
-            order.append((os.stat(file).st_mtime, file))
+            for file in file_list:
+                order.append((os.stat(file).st_mtime, file))
 
-        order.sort()
+            order.sort()
 
-        keep = int(self.config["keep"])
+            keep = int(self.config["keep"])
 
-        order = order[:-keep]
+            order = order[:-keep]
 
-        return [o[1] for o in order]
+            return [o[1] for o in order]
 
     def execute(self):
         """
@@ -216,11 +250,20 @@ class HouseKeeper(object):
 
         :return:
         """
-        for file in glob(join(CONFIG_DIR, "*")):
+        if CONFIG_DIR:
+            logger.debug("Looking for config files at %s" % CONFIG_DIR)
+            config_files = glob(join(CONFIG_DIR, "*"))
+            logger.debug("Found %s config files" % len(config_files))
+        else:
+            config_files = [CONFIG_FILE]
+
+        for file in config_files:
             if not isfile(file):
+                logger.debug("Config file '%s' is not a file, ignoring it" % file)
                 continue
 
             if file.endswith("~"):
+                logger.debug("Ignore config file '%s'" % file)
                 continue
 
             if file.endswith(".yaml"):
@@ -249,6 +292,7 @@ class HouseKeeper(object):
         :param path:
         :return:
         """
+        logger.info("Reading config file %s" % path)
         def as_dict(config):
             """
             Converts a ConfigParser object into a dictionary.
