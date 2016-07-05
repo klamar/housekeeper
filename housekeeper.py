@@ -197,6 +197,9 @@ class Keep(FindRemoveJob):
             return out.splitlines()
 
     def get_files_to_consider(self):
+        
+        consider_list = []
+        
         for root in self.roots:
             file_list = self.get_file_list(root)
 
@@ -211,8 +214,10 @@ class Keep(FindRemoveJob):
 
             order = order[:-keep]
 
-            return [o[1] for o in order]
-
+            consider_list += [o[1] for o in order]
+        
+        return consider_list
+    
     def execute(self):
         """
 
